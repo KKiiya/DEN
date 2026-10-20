@@ -11,6 +11,10 @@ add_library(web_service STATIC
     mk8d_country_flags.h
     nextendo_api.cpp
     nextendo_api.h
+    nextendo_island_cloud.cpp
+    nextendo_island_cloud.h
+    nextendo_nsa.cpp
+    nextendo_nsa.h
     population_scraper_client.cpp
     population_scraper_client.h
     verify_login.cpp

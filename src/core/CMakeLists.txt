@@ -911,6 +911,8 @@ add_library(core STATIC
     hle/service/olsc/daemon_controller.h
     hle/service/olsc/native_handle_holder.cpp
     hle/service/olsc/native_handle_holder.h
+    hle/service/olsc/olsc_async_result.cpp
+    hle/service/olsc/olsc_async_result.h
     hle/service/olsc/olsc_service_for_application.cpp
     hle/service/olsc/olsc_service_for_application.h
     hle/service/olsc/olsc_service_for_system_service.cpp

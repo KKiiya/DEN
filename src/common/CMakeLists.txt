@@ -106,10 +106,14 @@ add_library(
     nextendo_compatible_titles.h
     nextendo_friends.cpp
     nextendo_friends.h
+    nextendo_island_sync.cpp
+    nextendo_island_sync.h
     nextendo_nat.cpp
     nextendo_nat.h
     nextendo_outgoing_requests.cpp
     nextendo_outgoing_requests.h
+    nextendo_zip.cpp
+    nextendo_zip.h
     settings_common.cpp
     settings_common.h
     settings_enums.h
