@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "core/file_sys/fs_save_data_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "core/hle/service/os/event.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -340,6 +341,11 @@ public:
     void SetFilesystem(FileSys::VirtualFilesystem vfs);
 
     [[nodiscard]] FileSys::VirtualFilesystem GetFilesystem() const;
+
+    // [Nextendo] The directory where a title's save data lives on the host, for the given
+    // profile. Empty when the save doesn't exist yet.
+    [[nodiscard]] std::string GetSaveDataHostPath(u64 title_id, u128 user_id,
+                                                  FileSys::SaveDataType type) const;
 
     void RegisterCheatList(const std::vector<Memory::CheatEntry>& list,
                            const std::array<u8, 0x20>& build_id, u64 main_region_begin,

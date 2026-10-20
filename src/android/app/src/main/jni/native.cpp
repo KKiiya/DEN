@@ -110,6 +110,7 @@ extern "C" {
 #include "network/announce_multiplayer_session.h"
 #ifdef ENABLE_WEB_SERVICE
 #include "web_service/nextendo_api.h"
+#include "web_service/nextendo_island_cloud.h"
 #endif
 
 #define jconst [[maybe_unused]] const auto
@@ -1679,6 +1680,13 @@ jlong Java_org_yuzu_yuzu_1emu_NativeLibrary_nextendoPid(JNIEnv* env, jclass claz
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_nextendoPushOnline(JNIEnv* env, jclass clazz) {
     // DEN_PRESENCE
     WebService::NextendoApi::PushPresence(1, "", "", "");
+}
+
+void Java_org_yuzu_yuzu_1emu_NativeLibrary_nextendoRunPendingIslandUploads(JNIEnv* env,
+                                                                             jclass clazz) {
+    // [Nextendo] Animal Crossing: an island archiving left pending by a previous session is sent
+    // now, like the console's system service does when the console starts.
+    std::thread([] { WebService::NextendoIslandCloud::RunPending(); }).detach();
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_nextendoSignOut(JNIEnv* env, jclass clazz) {

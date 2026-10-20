@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <thread>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -12,6 +13,7 @@
 #include "common/fs/fs.h"
 #include "common/logging.h"
 #include "common/nextendo_account.h"
+#include "common/nextendo_island_sync.h"
 #include "common/fs/path_util.h"
 #include "common/adpf.h"
 #include "common/settings.h"
@@ -57,6 +59,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
+#include "web_service/nextendo_island_cloud.h"
 #include "core/memory.h"
 #include "core/memory/cheat_engine.h"
 #include "core/perf_stats.h"
@@ -70,6 +73,10 @@
 #include "video_core/video_core.h"
 
 namespace Core {
+
+// [Nextendo] The title currently running. The island archiving (Animal Crossing) must not start
+// while the game writes its save.
+std::atomic<u64> g_running_program_id{0};
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -334,7 +341,7 @@ struct System::Impl {
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
-            ShutdownMainProcess();
+            ShutdownMainProcess(system);
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
 
@@ -357,6 +364,9 @@ struct System::Impl {
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
 
+        // [Nextendo] The island archiving must not start while the game writes its save.
+        g_running_program_id = params.program_id;
+
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
 
@@ -367,7 +377,7 @@ struct System::Impl {
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
-            ShutdownMainProcess();
+            ShutdownMainProcess(system);
             return init_result;
         }
         // Waiting for GPU before initializing CPU
@@ -419,7 +429,50 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
-    void ShutdownMainProcess() {
+    // [Nextendo] Animal Crossing: New Horizons archives its island through the olsc:u service
+    // while the game runs, and, like the console's system service, the emulator sends it once the
+    // game is over ("the backup happens when you aren't playing"). The send is marked pending on
+    // the disk first, so an emulator closed before the end of it resumes at the next launch.
+    void UploadIslandAfterGame(System& system, u64 program_id) {
+        if (program_id == 0 || !Common::NextendoIslandSync::IsStrict(program_id)) {
+            return;
+        }
+
+        const Common::UUID profile = profile_manager.GetLastOpenedUser();
+        const std::string key = Common::NextendoIslandSync::Key(program_id, profile.RawString());
+
+        // The player must have enabled the archiving in the game.
+        if (Common::NextendoIslandSync::Get(key).setting != 1) {
+            return;
+        }
+
+        const std::string save_dir =
+            system.GetSaveDataHostPath(program_id, profile.AsU128(), FileSys::SaveDataType::Device);
+        if (save_dir.empty()) {
+            return;
+        }
+
+        WebService::NextendoIslandCloud::MarkPending(key, save_dir);
+
+        // The send itself must not hold the game hostage.
+        std::thread([program_id, save_dir, key] {
+            const auto outcome =
+                WebService::NextendoIslandCloud::UploadPending(program_id, save_dir, key);
+            LOG_INFO(Core, "[Nextendo] island backup after the game: {}", static_cast<int>(outcome));
+        }).detach();
+    }
+
+    void ShutdownMainProcess(System& system) {
+        // [Nextendo] The game isn't running anymore: the island archiving may start.
+        const u64 running_program_id = g_running_program_id;
+        g_running_program_id = 0;
+
+        // [Nextendo] Animal Crossing: the island is archived when the game ends, like the
+        // console's system service does ("the backup happens when you aren't playing"). The send
+        // is marked pending on the disk first, so an emulator closed before the end of it resumes
+        // at the next launch.
+        UploadIslandAfterGame(system, running_program_id);
+
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 
@@ -567,6 +620,12 @@ const CpuManager& System::GetCpuManager() const {
 }
 
 void System::Initialize() {
+    // [Nextendo] The island archiving (Animal Crossing) must not start while the game writes its
+    // save.
+    WebService::NextendoIslandCloud::IsGameRunning = [](u64 title_id) {
+        return g_running_program_id == title_id;
+    };
+
     impl->Initialize(*this);
 }
 
@@ -583,7 +642,7 @@ bool System::IsPaused() const {
 }
 
 void System::ShutdownMainProcess() {
-    impl->ShutdownMainProcess();
+    impl->ShutdownMainProcess(*this);
 }
 
 bool System::IsShuttingDown() const {
@@ -813,6 +872,26 @@ void System::SetFilesystem(FileSys::VirtualFilesystem vfs) {
 
 FileSys::VirtualFilesystem System::GetFilesystem() const {
     return impl->virtual_filesystem;
+}
+
+std::string System::GetSaveDataHostPath(u64 title_id, u128 user_id,
+                                        FileSys::SaveDataType type) const {
+    const auto save_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::SaveDir);
+    auto vfs_save_dir = impl->virtual_filesystem->OpenDirectory(
+        Common::FS::PathToUTF8String(save_dir), FileSys::OpenMode::Read);
+    if (!vfs_save_dir) {
+        return {};
+    }
+
+    const auto relative = FileSys::SaveDataFactory::GetFullPath(
+        GetApplicationProcessProgramID(), vfs_save_dir, FileSys::SaveDataSpaceId::User, type, title_id,
+        user_id, 0);
+
+    auto dir = vfs_save_dir->GetDirectoryRelative(relative);
+    if (!dir) {
+        return {};
+    }
+    return dir->GetFullPath();
 }
 
 void System::RegisterCheatList(const std::vector<Memory::CheatEntry>& list,

@@ -81,6 +81,10 @@ class YuzuApplication : Application() {
 
         // [Nextendo] CA bundle for the account/friends HTTPS API
         Thread { NativeLibrary.exportNextendoCaCerts() }.start()
+
+        // [Nextendo] Animal Crossing: an island archiving left pending by a previous session is
+        // sent now, like the console's system service does when the console starts.
+        Thread { NativeLibrary.nextendoRunPendingIslandUploads() }.start()
     }
 
     companion object {

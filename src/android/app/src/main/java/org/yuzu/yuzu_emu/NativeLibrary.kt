@@ -723,6 +723,9 @@ object NativeLibrary {
     external fun nextendoPid(): Long
     external fun nextendoPushOnline() // DEN_PRESENCE
 
+    // [Nextendo] Animal Crossing: sends the island archiving left pending by a previous session.
+    external fun nextendoRunPendingIslandUploads()
+
     // "" when no Nextendo account is linked
     external fun nextendoAccountName(): String
 
