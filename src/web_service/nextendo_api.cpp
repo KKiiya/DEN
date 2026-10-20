@@ -159,6 +159,27 @@ std::vector<u8> Sha256(std::string_view text) {
     return digest;
 }
 
+// 16 hexadecimal digits, the shape the account server uses for the baasUserID (the "nsa").
+u64 ParseHexU64(std::string_view text) {
+    if (text.size() != 16) {
+        return 0;
+    }
+    u64 value = 0;
+    for (const char c : text) {
+        value <<= 4;
+        if (c >= '0' && c <= '9') {
+            value |= static_cast<u64>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            value |= static_cast<u64>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            value |= static_cast<u64>(c - 'A' + 10);
+        } else {
+            return 0;
+        }
+    }
+    return value;
+}
+
 std::string RandomUrlSafe(std::size_t bytes) {
     std::vector<u8> buffer(bytes);
     if (RAND_bytes(buffer.data(), static_cast<int>(buffer.size())) != 1) {
@@ -386,6 +407,42 @@ httplib::Result Send(const std::string& method, const std::string& path, const s
         LOG_ERROR(WebService, "Send {} {}: httplib error={}, openssl verify_result={} ({})",
                   method, path, httplib::to_string(result.error()), verify_result,
                   X509_verify_cert_error_string(verify_result));
+    }
+    return result;
+}
+
+// Like Send, but the body is raw bytes (the Animal Crossing island is a ZIP, not JSON).
+httplib::Result SendBinary(const std::string& method, const std::string& path, std::string_view body,
+                           const std::string& bearer, const httplib::Headers& extra_headers = {}) {
+    std::string effective_bearer = bearer;
+    if (!bearer.empty() && bearer == Common::NextendoAccount::GetToken()) {
+        const u64 expiry = Common::NextendoAccount::GetTokenExpiry();
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count());
+        if (expiry != 0 && now + 60 >= expiry && RefreshAccessToken()) {
+            effective_bearer = Common::NextendoAccount::GetToken();
+        }
+    }
+    static std::mutex client_mutex;
+    std::lock_guard lock{client_mutex};
+    httplib::Client& client = SharedClient();
+
+    httplib::Headers headers{{"User-Agent", "citron"}};
+    if (!effective_bearer.empty()) {
+        headers.emplace("Authorization", "Bearer " + effective_bearer);
+    }
+    for (const auto& [key, value] : extra_headers) {
+        headers.emplace(key, value);
+    }
+
+    const std::string content(body);
+    auto result = method == "GET" ? client.Get(path, headers)
+                 : method == "PUT" ? client.Put(path, headers, content, "application/octet-stream")
+                                   : client.Post(path, headers, content, "application/octet-stream");
+    if (!result) {
+        LOG_ERROR(WebService, "SendBinary {} {}: httplib error={}", method, path,
+                  httplib::to_string(result.error()));
     }
     return result;
 }
@@ -806,6 +863,129 @@ std::optional<std::vector<u8>> PullSave(const std::string& title_id_hex) {
     return std::vector<u8>(result->body.begin(), result->body.end());
 }
 
+std::string GetMyNsa() {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return {};
+    }
+
+    const auto result = Send("GET", "/api/me", {}, token);
+    if (ClearSessionIfRejected(result) || !result || result->status != 200) {
+        return {};
+    }
+
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        std::string nsa = json.value("nsa", std::string{});
+        if (nsa.empty()) {
+            // Some account server versions put it in the account object.
+            if (const auto account = json.find("account"); account != json.end()) {
+                nsa = account->value("nsa", std::string{});
+            }
+        }
+        if (nsa.size() == 16) {
+            return nsa;
+        }
+    } catch (const nlohmann::json::exception&) {
+    }
+    return {};
+}
+
+std::optional<SaveMeta> GetSaveMeta(const std::string& title_id_hex) {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return std::nullopt;
+    }
+
+    const auto result = Send("GET", "/api/save/" + title_id_hex + "/meta", {}, token);
+    if (ClearSessionIfRejected(result) || !result || result->status != 200) {
+        return std::nullopt;
+    }
+
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        SaveMeta meta;
+        meta.exists = json.value("exists", false);
+        meta.rev = json.value("rev", static_cast<u64>(0));
+        meta.custom_base64 = json.value("custom", std::string{});
+        return meta;
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<SaveBlob> PullSaveBlob(const std::string& title_id_hex) {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return std::nullopt;
+    }
+
+    const auto result = Send("GET", "/api/save/" + title_id_hex, {}, token);
+    if (ClearSessionIfRejected(result)) {
+        return std::nullopt;
+    }
+    if (!result || result->status == 204) {
+        return std::nullopt; // no cloud save stored yet
+    }
+    if (result->status != 200) {
+        LOG_WARNING(WebService, "Nextendo island pull failed (HTTP {})", result->status);
+        return std::nullopt;
+    }
+
+    SaveBlob blob;
+    blob.data.assign(result->body.begin(), result->body.end());
+    if (result->has_header("X-Save-Rev")) {
+        blob.rev = ParseHexU64(result->get_header_value("X-Save-Rev"));
+    }
+    return blob;
+}
+
+PushSaveOutcome PushSaveBlob(const std::string& title_id_hex, std::span<const u8> data,
+                             const std::string& device_id, const std::string& custom_base64) {
+    PushSaveOutcome out;
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        out.error = "Not signed in.";
+        return out;
+    }
+
+    httplib::Headers headers;
+    if (!device_id.empty()) {
+        headers.emplace("X-Save-Device", device_id);
+    }
+    if (!custom_base64.empty()) {
+        headers.emplace("X-Save-Custom", custom_base64);
+    }
+
+    const std::string body(reinterpret_cast<const char*>(data.data()), data.size());
+    const auto result = SendBinary("PUT", "/api/save/" + title_id_hex, body, token, headers);
+
+    if (ClearSessionIfRejected(result)) {
+        out.error = "Session expired.";
+        return out;
+    }
+    if (!result) {
+        out.error = "Could not reach the Nextendo account server.";
+        return out;
+    }
+    if (result->status == 413) {
+        out.too_large = true;
+        out.error = ErrorFrom(result->body, "Cloud storage limit reached.");
+        return out;
+    }
+    if (result->status != 200) {
+        out.error = ErrorFrom(result->body, "Could not upload the island.");
+        return out;
+    }
+
+    out.ok = true;
+    try {
+        out.kept = nlohmann::json::parse(result->body).value("kept", false);
+    } catch (const nlohmann::json::exception&) {
+    }
+    return out;
+}
+
 PushSaveOutcome PushSave(const std::string& title_id_hex, std::span<const u8> data) {
     PushSaveOutcome out;
     const std::string token = Common::NextendoAccount::GetToken();
@@ -1120,6 +1300,10 @@ namespace {
 Friend ParseFriend(const nlohmann::json& json) {
     Friend out;
     out.pid = json.value("pid", u64{0});
+    // [Nextendo] The friend's baasUserID, the identity a Switch announces to the games. Animal
+    // Crossing compares it with the console's own friend list, so the emulator has to serve it
+    // under that name for a Switch and the emulator to recognise each other.
+    out.nsa = ParseHexU64(json.value("nsa", std::string{}));
     out.name = json.value("name", std::string{});
     if (out.name.empty()) {
         out.name = json.value("username", std::string{});

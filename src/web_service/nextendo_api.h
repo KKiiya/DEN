@@ -54,6 +54,10 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
 // GET /api/nex-token. Returns an empty string on failure.
 std::string FetchNexToken(const std::string& session_token);
 
+// The baasUserID the linked account presents to the console (the "nsa" field of GET /api/me),
+// as 16 hexadecimal digits. Empty when the account server doesn't expose it.
+std::string GetMyNsa();
+
 // Uses the stored account token. Answers only about the caller's own account.
 OnlineStatus GetOnlineStatus();
 
@@ -71,6 +75,7 @@ void SyncHistory(const std::vector<HistoryEntry>& entries);
 
 struct Friend {
     u64 pid = 0;
+    u64 nsa = 0;           // the friend's baasUserID, 0 when the server doesn't expose it
     std::string name;        // console nickname if set, else account username
     std::string friend_code;
     s32 presence_status = 0; // 0 offline, 1 online, 2 in a game
@@ -185,6 +190,27 @@ struct PushSaveOutcome {
 // Uploads this title's save. The server rejects a drastically smaller upload against an existing
 // larger save (kept=true) and enforces a per-account storage limit (too_large=true).
 PushSaveOutcome PushSave(const std::string& title_id_hex, std::span<const u8> data);
+
+// The state of the account's cloud save for a title, as GET /api/save/<title>/meta answers it.
+struct SaveMeta {
+    bool exists = false;
+    u64 rev = 0;
+    s64 updated_at = 0; // unix seconds; 0 when unknown
+    std::string custom_base64;
+};
+std::optional<SaveMeta> GetSaveMeta(const std::string& title_id_hex);
+
+// The cloud save itself, with the revision the server gave it.
+struct SaveBlob {
+    std::vector<u8> data;
+    u64 rev = 0;
+};
+std::optional<SaveBlob> PullSaveBlob(const std::string& title_id_hex);
+
+// Uploads a cloud save as raw bytes (the Animal Crossing island), with the metadata the island
+// carries: the device it comes from and the custom data the game reads back.
+PushSaveOutcome PushSaveBlob(const std::string& title_id_hex, std::span<const u8> data,
+                             const std::string& device_id, const std::string& custom_base64);
 
 struct Profile {
     bool ok = false;

@@ -14,6 +14,11 @@ namespace Common::NextendoFriends {
 
 struct Entry {
     u64 pid = 0;
+    // The friend's baasUserID, the identity a Switch announces to the games. Animal Crossing
+    // compares it with the console's own friend list, so the emulator has to serve the friends
+    // under that name for a Switch and the emulator to recognise each other. 0 when the account
+    // server doesn't expose it.
+    u64 nsa = 0;
     std::string name;
     s32 status = 0;        // 0 offline, 1 online, 2 in a game
     std::string app_field; // opaque per-title presence blob, raw bytes (already base64-decoded)

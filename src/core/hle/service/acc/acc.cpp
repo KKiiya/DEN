@@ -44,6 +44,7 @@
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/server_manager.h"
 #include "core/loader/loader.h"
+#include "web_service/nextendo_nsa.h"
 
 namespace Service::Account {
 
@@ -993,6 +994,17 @@ private:
     u64 GetEffectiveAccountId() const {
         if (Common::NextendoAccount::IsLinked()) {
             if (const u64 pid = Common::NextendoAccount::GetPid(); pid != 0) {
+                // [Nextendo] Animal Crossing: New Horizons compares the NSA the player announces
+                // with the console's nn::friends list: a Switch announces its baasUserID, so in
+                // that game the emulator announces the baasUserID too (the account server still
+                // recognises the emulator by the nx2 token of the id_token). The other games keep
+                // the PID.
+                const u64 program_id = system.GetApplicationProcessProgramID();
+                if (WebService::NextendoNsa::TitleUsesBaasNsa(program_id)) {
+                    if (const u64 nsa = WebService::NextendoNsa::Get(); nsa != 0) {
+                        return nsa;
+                    }
+                }
                 return pid;
             }
         }

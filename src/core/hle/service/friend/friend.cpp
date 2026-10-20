@@ -28,6 +28,7 @@
 #include "core/loader/loader.h"
 #ifdef ENABLE_WEB_SERVICE
 #include "web_service/nextendo_api.h"
+#include "web_service/nextendo_nsa.h"
 #endif
 
 // [UNITY-FIX] undef Win32 macros shadowing ServiceContext methods.
@@ -155,6 +156,31 @@ Common::UUID UidForPid(u64 pid) {
     return Common::UUID{raw};
 }
 
+// [Nextendo] Animal Crossing: New Horizons compares the NSA each player announces (the Pia
+// session, the header of a card) with the console's nn::friends list (Friend::GetAccountId). A
+// Switch announces its baasUserID and sorts its friends by baasUserID; an emulator announcing the
+// PID is never recognised as a friend by a Switch (best friends impossible, cards discarded). In
+// ACNH, the emulator announces the baasUserID and sorts its friends by baasUserID, like a Switch.
+// Only when our own baasUserID is known, otherwise everything stays on the PID.
+bool UseNsaIds(Core::System& system) {
+    const u64 program_id = system.GetApplicationProcessProgramID();
+    return WebService::NextendoNsa::TitleUsesBaasNsa(program_id) && WebService::NextendoNsa::Get() != 0;
+}
+
+// The id the game knows a friend by.
+u64 FriendId(const Common::NextendoFriends::Entry& entry, bool use_nsa) {
+    return (use_nsa && entry.nsa != 0) ? entry.nsa : entry.pid;
+}
+
+// The friend the game asks about, by the id it knows it under.
+const Common::NextendoFriends::Entry* FindFriend(
+    const std::vector<Common::NextendoFriends::Entry>& entries, u64 id, bool use_nsa) {
+    const auto it = std::find_if(entries.begin(), entries.end(), [id, use_nsa](const auto& e) {
+        return FriendId(e, use_nsa) == id;
+    });
+    return it != entries.end() ? &*it : nullptr;
+}
+
 // Mirrors FriendImpl's proven-working layout (UUID + pid + 0x21-byte nickname) rather than
 // acc::ProfileBase (UUID + timestamp), which is an unrelated local-account struct this was
 // wrongly modeled on -- GetProfileList resolved real data (confirmed live) but still rendered
@@ -174,24 +200,29 @@ static_assert(sizeof(ProfileImpl) == 0x40, "ProfileImpl has the wrong size");
 // friend. Strangers (e.g. a balloon owner you're not friends with) aren't resolvable here --
 // titles that also carry a plain name string on the wire (Odyssey's DataStoreSearchBalloonResult.
 // ownerName) fall back to that; this only covers the profile-lookup path.
-bool ResolveProfileName(u64 pid, std::string& out_name) {
-    if (Common::NextendoAccount::IsLinked() && Common::NextendoAccount::GetPid() == pid) {
+bool ResolveProfileName(Core::System& system, u64 pid, std::string& out_name) {
+    // [Nextendo] In Animal Crossing the game knows the friends by their baasUserID, and asks for
+    // the profiles under that name.
+    if (Common::NextendoAccount::IsLinked() &&
+        (Common::NextendoAccount::GetPid() == pid ||
+         (WebService::NextendoNsa::TitleUsesBaasNsa(system.GetApplicationProcessProgramID()) &&
+          WebService::NextendoNsa::Get() == pid && pid != 0))) {
         out_name = Common::NextendoAccount::GetUsername();
         return true;
     }
     const auto entries = Common::NextendoFriends::Get();
-    const auto it = std::find_if(entries.begin(), entries.end(),
-                                  [pid](const auto& e) { return e.pid == pid; });
-    if (it != entries.end()) {
+    const bool use_nsa = UseNsaIds(system);
+    const auto* it = FindFriend(entries, pid, use_nsa);
+    if (it != nullptr) {
         out_name = it->name;
         return true;
     }
     return false;
 }
 
-std::optional<ProfileImpl> MakeProfile(u64 pid) {
+std::optional<ProfileImpl> MakeProfile(Core::System& system, u64 pid) {
     std::string name;
-    if (!ResolveProfileName(pid, name)) {
+    if (!ResolveProfileName(system, pid, name)) {
         return std::nullopt;
     }
     ProfileImpl out{};
@@ -202,10 +233,11 @@ std::optional<ProfileImpl> MakeProfile(u64 pid) {
     return out;
 }
 
-FriendImpl MakeFriend(const Common::NextendoFriends::Entry& entry) {
+FriendImpl MakeFriend(const Common::NextendoFriends::Entry& entry, bool use_nsa) {
     FriendImpl out{};
-    out.user_id = UidForPid(entry.pid);
-    out.network_user_id = entry.pid;
+    const u64 id = FriendId(entry, use_nsa);
+    out.user_id = UidForPid(id);
+    out.network_user_id = id;
 
     const auto length = std::min(entry.name.size(), out.nickname.size() - 1);
     std::memcpy(out.nickname.data(), entry.name.data(), length);
@@ -387,12 +419,13 @@ public:
                                      ? Common::NextendoFriends::GetWarm(2000)
                                      : Common::NextendoFriends::Get();
             const auto capacity = ctx.GetWriteBufferNumElements<u64>();
+            const bool use_nsa = UseNsaIds(system);
             std::vector<u64> ids;
             for (const auto& entry : entries) {
                 if (ids.size() >= capacity) {
                     break;
                 }
-                ids.push_back(entry.pid);
+                ids.push_back(FriendId(entry, use_nsa));
             }
             if (!ids.empty()) {
                 ctx.WriteBuffer(ids);
@@ -827,6 +860,7 @@ void NextendoSyncThread(Core::System& system, std::shared_ptr<std::atomic<bool>>
                 for (const auto& entry : list.friends) {
                     Common::NextendoFriends::Entry cached;
                     cached.pid = entry.pid;
+                    cached.nsa = entry.nsa;
                     cached.name = entry.name;
                     cached.status = entry.presence_status;
                     cached.app_field = entry.app_field;
@@ -925,12 +959,13 @@ void IFriendService::GetFriendList(HLERequestContext& ctx) {
     if (friend_offset == 0 && ctx.CanWriteBuffer()) {
         const auto entries = Common::NextendoFriends::Get();
         const auto capacity = ctx.GetWriteBufferNumElements<FriendImpl>();
+        const bool use_nsa = UseNsaIds(system);
         std::vector<FriendImpl> list;
         for (const auto& entry : entries) {
             if (list.size() >= capacity) {
                 break;
             }
-            list.push_back(MakeFriend(entry));
+            list.push_back(MakeFriend(entry, use_nsa));
         }
         if (!list.empty()) {
             ctx.WriteBuffer(list);
@@ -1094,9 +1129,9 @@ void IFriendService::UpdateFriendInfo(HLERequestContext& ctx) {
     std::vector<FriendImpl> info(out_count);
     for (std::size_t i = 0; i < out_count; ++i) {
         const auto wanted = requested_ids[i];
-        const auto it = std::find_if(entries.begin(), entries.end(),
-                                     [wanted](const auto& e) { return e.pid == wanted; });
-        info[i] = it != entries.end() ? MakeFriend(*it) : FriendImpl{};
+        const bool use_nsa = UseNsaIds(system);
+        const auto* it = FindFriend(entries, wanted, use_nsa);
+        info[i] = it ? MakeFriend(*it, use_nsa) : FriendImpl{};
     }
 
     if (!info.empty()) {
@@ -1132,11 +1167,11 @@ void IFriendService::GetFriendProfileImage(HLERequestContext& ctx) {
     const auto pid = PidForUid(uuid);
 
     const auto entries = Common::NextendoFriends::Get();
-    const auto it = std::find_if(entries.begin(), entries.end(),
-                                 [pid](const auto& e) { return e.pid == pid; });
+    const bool use_nsa = UseNsaIds(system);
+    const auto* it = FindFriend(entries, pid, use_nsa);
 
     u32 size = 0;
-    if (it != entries.end() && !it->image.empty()) {
+    if (it != nullptr && !it->image.empty()) {
         ctx.WriteBuffer(it->image);
         size = static_cast<u32>(it->image.size());
     }
@@ -1157,11 +1192,11 @@ void IFriendService::GetFriendProfileImageWithImageSize(HLERequestContext& ctx) 
     const auto pid = PidForUid(uuid);
 
     const auto entries = Common::NextendoFriends::Get();
-    const auto it = std::find_if(entries.begin(), entries.end(),
-                                 [pid](const auto& e) { return e.pid == pid; });
+    const bool use_nsa = UseNsaIds(system);
+    const auto* it = FindFriend(entries, pid, use_nsa);
 
     u32 size = 0;
-    if (it != entries.end() && !it->image.empty()) {
+    if (it != nullptr && !it->image.empty()) {
         ctx.WriteBuffer(it->image);
         size = static_cast<u32>(it->image.size());
     }
@@ -1201,7 +1236,7 @@ namespace {
 // [Nextendo] Same ids-in (buffer 0, u64 pids)/structs-out contract as GetFriendDetailedInfo --
 // only proven-working pattern for this class of call in this codebase, so mirrored here rather
 // than guessing a UUID-keyed format with nothing to test it against.
-void RespondProfileList(HLERequestContext& ctx, const char* name) {
+void RespondProfileList(Core::System& system, HLERequestContext& ctx, const char* name) {
     constexpr std::size_t MaxRequestedIds = 300;
     std::vector<u64> requested_ids;
     if (ctx.CanReadBuffer(0)) {
@@ -1219,7 +1254,7 @@ void RespondProfileList(HLERequestContext& ctx, const char* name) {
         if (profiles.size() >= capacity) {
             break;
         }
-        if (const auto profile = MakeProfile(pid)) {
+        if (const auto profile = MakeProfile(system, pid)) {
             profiles.push_back(*profile);
         }
     }
@@ -1237,11 +1272,11 @@ void RespondProfileList(HLERequestContext& ctx, const char* name) {
 } // Anonymous namespace
 
 void IFriendService::GetProfileList(HLERequestContext& ctx) {
-    RespondProfileList(ctx, "GetProfileList");
+    RespondProfileList(system, ctx, "GetProfileList");
 }
 
 void IFriendService::GetProfileListV2(HLERequestContext& ctx) {
-    RespondProfileList(ctx, "GetProfileListV2");
+    RespondProfileList(system, ctx, "GetProfileListV2");
 }
 
 void IFriendService::DeclareOpenOnlinePlaySession(HLERequestContext& ctx) {
@@ -1310,9 +1345,9 @@ void IFriendService::GetFriendDetailedInfo(HLERequestContext& ctx) {
     std::vector<FriendImpl> info(out_count);
     for (std::size_t i = 0; i < out_count; ++i) {
         const auto wanted = requested_ids[i];
-        const auto it = std::find_if(entries.begin(), entries.end(),
-                                     [wanted](const auto& e) { return e.pid == wanted; });
-        info[i] = it != entries.end() ? MakeFriend(*it) : FriendImpl{};
+        const bool use_nsa = UseNsaIds(system);
+        const auto* it = FindFriend(entries, wanted, use_nsa);
+        info[i] = it ? MakeFriend(*it, use_nsa) : FriendImpl{};
     }
 
     if (!info.empty()) {
@@ -1354,12 +1389,13 @@ void IFriendService::GetFriendListForViewer(HLERequestContext& ctx) {
     if (ctx.CanWriteBuffer()) {
         const auto entries = Common::NextendoFriends::Get();
         const auto capacity = ctx.GetWriteBufferNumElements<u64>();
+        const bool use_nsa = UseNsaIds(system);
         std::vector<u64> ids;
         for (const auto& entry : entries) {
             if (ids.size() >= capacity) {
                 break;
             }
-            ids.push_back(entry.pid);
+            ids.push_back(FriendId(entry, use_nsa));
         }
         if (!ids.empty()) {
             ctx.WriteBuffer(ids);
@@ -1411,10 +1447,10 @@ void IFriendService::UpdateFriendInfoForViewer(HLERequestContext& ctx) {
     std::size_t matched_count = 0;
     for (std::size_t i = 0; i < out_count; ++i) {
         const auto wanted = requested_ids[i];
-        const auto it = std::find_if(entries.begin(), entries.end(),
-                                     [wanted](const auto& e) { return e.pid == wanted; });
-        if (it != entries.end()) {
-            info[i] = MakeFriend(*it);
+        const bool use_nsa = UseNsaIds(system);
+        const auto* it = FindFriend(entries, wanted, use_nsa);
+        if (it != nullptr) {
+            info[i] = MakeFriend(*it, use_nsa);
             ++matched_count;
         } else {
             info[i] = FriendImpl{};
@@ -1469,9 +1505,9 @@ void IFriendService::GetFriendDetailedInfoV2(HLERequestContext& ctx) {
     std::vector<FriendImpl> info(out_count);
     for (std::size_t i = 0; i < out_count; ++i) {
         const auto wanted = requested_ids[i];
-        const auto it = std::find_if(entries.begin(), entries.end(),
-                                     [wanted](const auto& e) { return e.pid == wanted; });
-        info[i] = it != entries.end() ? MakeFriend(*it) : FriendImpl{};
+        const bool use_nsa = UseNsaIds(system);
+        const auto* it = FindFriend(entries, wanted, use_nsa);
+        info[i] = it ? MakeFriend(*it, use_nsa) : FriendImpl{};
     }
 
     if (!info.empty()) {
@@ -1564,7 +1600,7 @@ void IFriendService::GetBlockedUserListV2(HLERequestContext& ctx) {
 }
 
 void IFriendService::GetProfileExtraList(HLERequestContext& ctx) {
-    RespondProfileList(ctx, "GetProfileExtraList");
+    RespondProfileList(system, ctx, "GetProfileExtraList");
 }
 
 void IFriendService::GetRelationship(HLERequestContext& ctx) {
@@ -1576,7 +1612,7 @@ void IFriendService::GetRelationship(HLERequestContext& ctx) {
 }
 
 void IFriendService::GetProfileExtraListV2(HLERequestContext& ctx) {
-    RespondProfileList(ctx, "GetProfileExtraListV2");
+    RespondProfileList(system, ctx, "GetProfileExtraListV2");
 }
 
 void IFriendService::GetUserPresenceView(HLERequestContext& ctx) {
